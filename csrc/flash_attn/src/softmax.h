@@ -34,6 +34,24 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &t
     }
 }
 
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Engine2, typename Layout2, typename Operator>
+__device__ __forceinline__ void weighted_thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Tensor<Engine2, Layout2> const &weight, Operator &op) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    static_assert(Layout2::rank == 2, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
+    CUTE_STATIC_ASSERT_V(size<0>(weight) == size<0>(tensor));
+    CUTE_STATIC_ASSERT_V(size<1>(weight) == size<1>(tensor));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); mi++) {
+        summary(mi) = zero_init ? (tensor(mi, 0) * weight(mi, 0)) : op(summary(mi), tensor(mi, 0) * weight(mi, 0));
+        #pragma unroll
+        for (int ni = 1; ni < size<1>(tensor); ni++) {
+            summary(mi) = op(summary(mi), tensor(mi, ni) * weight(mi, ni));
+        }
+    }
+}
+
 template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
@@ -59,6 +77,12 @@ template<bool zero_init=true, typename Engine0, typename Layout0, typename Engin
 __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
     SumOp<float> sum_op;
     thread_reduce_<zero_init>(tensor, sum, sum_op);
+}
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Engine2, typename Layout2>
+__device__ __forceinline__ void weighted_reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum, Tensor<Engine2, Layout2> &weight){
+    SumOp<float> sum_op;
+    weighted_thread_reduce_<zero_init>(tensor, sum, weight, sum_op);
 }
 
 // Apply the exp to all the elements.
@@ -162,6 +186,40 @@ struct Softmax {
             // We don't do the reduce across threads here since we don't need to use the row_sum.
             // We do that reduce at the end when we need to normalize the softmax.
             flash::reduce_sum</*zero_init=*/false>(scores, row_sum);
+        }
+    };
+
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
+    __forceinline__ __device__ void softmax_weighted_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, Tensor2 &acc_w, float softmax_scale_log2) {
+        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor weight = make_tensor(acc_w.data(), flash::convert_layout_acc_rowcol(acc_w.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        if (Is_first) {
+            flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::weighted_reduce_sum</*zero_init=*/true>(scores, row_sum, weight);
+        } else {
+            Tensor scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev);
+            flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+            Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+            static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale;
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            // We don't do the reduce across threads here since we don't need to use the row_sum.
+            // We do that reduce at the end when we need to normalize the softmax.
+            flash::weighted_reduce_sum</*zero_init=*/false>(scores, row_sum, weight);
         }
     };
 
