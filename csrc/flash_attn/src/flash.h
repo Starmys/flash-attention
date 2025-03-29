@@ -131,6 +131,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
+    int num_segments;  // If received previous output and LSE: num_segments = num_splits + 1; else: num_segments = num_splits
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;

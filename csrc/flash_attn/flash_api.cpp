@@ -215,7 +215,9 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
+    const int num_splits, const int num_sm,
+    const bool add_previous, at::Tensor previous_out, at::Tensor previous_lse,
+    struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
@@ -232,13 +234,25 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
         }
-        if (params.num_splits > 1) {
+        if (add_previous) {
+            if (params.num_splits < 2) {
+                params.num_splits = 2;
+            }
+            params.num_segments = params.num_splits + 1;
+        } else {
+            params.num_segments = params.num_splits;
+        }
+        if (params.num_segments > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            if (add_previous) {
+                softmax_lse_accum = torch::cat({ softmax_lse_accum, previous_lse.unsqueeze(0) }, 0);
+                out_accum = torch::cat({ out_accum, previous_out.toType(at::kFloat).unsqueeze(0) }, 0);
+            }
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
-        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+        TORCH_CHECK(params.num_segments <= 128, "num_segments > 128 not supported");
     }
 
     return std::make_tuple(softmax_lse_accum, out_accum);
@@ -268,6 +282,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 c10::optional<const at::Tensor> &weight_, // batch_size_c x num_heads_k x seqlen_q x seqlen_k
+                c10::optional<const at::Tensor> &previous_out_, // batch_size x seqlen_q x num_heads x head_size
+                c10::optional<const at::Tensor> &previous_lse_, // batch_size x num_heads x seqlen_q
                 c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &seqlens_k_, // batch_size
@@ -347,6 +363,18 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(weight, batch_size, num_heads_k, seqlen_q, seqlen_k);
     }
 
+    at::Tensor previous_out, previous_lse;
+    const bool add_previous = previous_out_.has_value() && previous_lse_.has_value();
+    if (add_previous) {
+        previous_out = previous_out_.value();
+        TORCH_CHECK(previous_out.dtype() == q_dtype, "query and previous output must have the same dtype");
+        TORCH_CHECK(previous_out.stride(-1) == 1, "Previous output tensor must have contiguous last dimension");
+        CHECK_SHAPE(previous_out, batch_size, seqlen_q, num_heads, head_size_og);
+        previous_lse = previous_lse_.value();
+        TORCH_CHECK(previous_lse.dtype() == torch::kFloat, "Previous LSE must have float32 dtype");
+        CHECK_SHAPE(previous_lse, batch_size, num_heads, seqlen_q);
+    }
+
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
@@ -355,6 +383,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
+        if (add_previous) {
+            previous_out = previous_out.reshape({batch_size, num_heads_k, ngroups, head_size_og});
+            previous_lse = previous_lse.reshape({batch_size, num_heads_k, ngroups});
+        }
+    } else {
+        if (add_previous) {
+            previous_out = previous_out.transpose(1, 2);
+        }
     }
 
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
@@ -523,7 +559,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-        head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
+        head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()),
+        add_previous, previous_out, previous_lse, opts);
+    // std::printf("num_splits=%d, num_segments=%d\n", params.num_splits, params.num_segments);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
