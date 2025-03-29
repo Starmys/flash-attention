@@ -40,7 +40,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
                       void *seqused_k,
-                      const at::Tensor p,
+                      void *p,
                       void *softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
@@ -85,8 +85,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.seqused_k = static_cast<int *>(seqused_k);
 
-    // P = softmax(QK^T)
-    params.p_ptr = p.data_ptr();
+    // P = weight
+    params.p_ptr = p;
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
@@ -267,7 +267,7 @@ std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                const at::Tensor &weight,            // batch_size_c x num_heads_k x seqlen_q x seqlen_k
+                c10::optional<const at::Tensor> &weight_, // batch_size_c x num_heads_k x seqlen_q x seqlen_k
                 c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &seqlens_k_, // batch_size
@@ -299,14 +299,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
-    TORCH_CHECK(weight.dtype() == q_dtype, "query and weight must have the same dtype");  // TODO
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(weight.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
@@ -340,7 +338,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
 
-    // CHECK_SHAPE(weight, batch_size, num_heads_k, seqlen_q, seqlen_k);
+    at::Tensor weight;
+    const bool is_weighted = weight_.has_value();
+    if (is_weighted) {
+        weight = weight_.value();
+        TORCH_CHECK(weight.dtype() == q_dtype, "query and weight must have the same dtype");
+        TORCH_CHECK(weight.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+        CHECK_SHAPE(weight, batch_size, num_heads_k, seqlen_q, seqlen_k);
+    }
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
@@ -364,7 +369,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
-    CHECK_SHAPE(weight, batch_size, num_heads_k, seqlen_q, seqlen_k);
 
     at::Tensor q_padded, kcache_padded, vcache_padded;
     if (head_size_og % 8 != 0) {
@@ -396,10 +400,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     at::Tensor weight_padded;
-    if (seqlen_k_rounded != seqlen_k) {
-        weight_padded = torch::nn::functional::pad(weight, torch::nn::functional::PadFuncOptions({0, seqlen_k_rounded - seqlen_k}));
-    } else {
-        weight_padded = weight;
+    if (is_weighted) {
+        if (seqlen_k_rounded != seqlen_k) {
+            weight_padded = torch::nn::functional::pad(weight, torch::nn::functional::PadFuncOptions({0, seqlen_k_rounded - seqlen_k}));
+        } else {
+            weight_padded = weight;
+        }
     }
 
     auto opts = q.options();
@@ -417,7 +423,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
-                     weight_padded,
+                     is_weighted ? weight_padded.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,

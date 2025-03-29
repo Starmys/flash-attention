@@ -47,7 +47,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_weighted, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -131,7 +131,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
 
-    const index_t row_offset_p = ((bidb * params.h + bidh / params.h_h_k_ratio) * params.seqlen_q
+    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
@@ -182,9 +182,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP);
-    Tensor tWgW  = thr_mma.partition_C(gP);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+
+    auto gmem_ptr_w = make_gmem_ptr(reinterpret_cast<Element*>(params.p_ptr));
+    auto w_shape = make_shape(params.b, params.h, params.seqlen_k_rounded);
+    auto w_stride = make_stride(params.h * params.seqlen_k_rounded, params.seqlen_k_rounded, 1);
+    auto w_layout = make_layout(w_shape, w_stride);
+    Tensor mW = make_tensor(gmem_ptr_w, w_layout);
+    auto mW_slice = mW(bidb, bidh, _);
+
+    Tensor caccP = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor taccPcP = thr_mma.partition_C(caccP);                           // (MMA,MMA_M,MMA_N)
+    static_assert(decltype(size<0>(taccPcP))::value == 4);
+    // Convert to ((2, 2), MMA_M, MMA_N) then take only the col indices.
+    Tensor taccPcP_col = logical_divide(taccPcP, Shape<_2>{})(make_coord(_, 0), 0, _);
 
     //
     // Copy Atom retiling
@@ -339,13 +351,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
-        Tensor acc_w = make_fragment_like(acc_s);
-        cute::copy(tWgW, acc_w);
-        tWgW.data() = tWgW.data() + (-kBlockN);
-        masking_step == 0
-            ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
-            : softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
-
+        if constexpr (Is_weighted) {
+            Tensor acc_w = make_tensor<float>(Shape<Int</*kNCols=*/2 * size<2>(acc_s)>>{});
+            CUTE_STATIC_ASSERT_V(size(acc_w) == size(taccPcP_col));                     // MMA_N
+            #pragma unroll
+            for (int ni = 0; ni < size(acc_w); ++ni) {
+                const int col = get<1>(taccPcP_col(ni));
+                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+            }
+            masking_step == 0
+                ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
+                : softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        } else {
+            masking_step == 0
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+        }
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -407,10 +428,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
-        Tensor acc_w = make_fragment_like(acc_s);
-        cute::copy(tWgW, acc_w);
-        tWgW.data() = tWgW.data() + (-kBlockN);
-        softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        if constexpr (Is_weighted) {
+            Tensor acc_w = make_tensor<float>(Shape<Int</*kNCols=*/2 * size<2>(acc_s)>>{});
+            CUTE_STATIC_ASSERT_V(size(acc_w) == size(taccPcP_col));                     // MMA_N
+            #pragma unroll
+            for (int ni = 0; ni < size(acc_w); ++ni) {
+                const int col = get<1>(taccPcP_col(ni));
+                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+            }
+            softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        } else {
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+        }
 
         Tensor rP = flash::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -501,7 +530,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_weighted, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -598,11 +627,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
         : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
-    // const index_t row_offset_p = bidb * params.softmax_weight_batch_stride +
-    //     + bidh * params.softmax_weight_head_stride + (m_block * kBlockM) * params.softmax_weight_q_stride
-    //     + (n_block_max - 1) * kBlockN;
-    const index_t row_offset_p = ((bidb_cache * params.h + bidh / params.h_h_k_ratio) * params.seqlen_q
-        + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -616,9 +640,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
-    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
-                            Shape<Int<kBlockM>, Int<kBlockN>>{},
-                            make_stride(params.seqlen_k_rounded, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
@@ -643,9 +664,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
-    Tensor tWgW  = thr_mma.partition_C(gP);
-
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+
+    auto gmem_ptr_w = make_gmem_ptr(reinterpret_cast<Element*>(params.p_ptr));
+    auto w_shape = make_shape(params.b, params.h, params.seqlen_k_rounded);
+    auto w_stride = make_stride(params.h * params.seqlen_k_rounded, params.seqlen_k_rounded, 1);
+    auto w_layout = make_layout(w_shape, w_stride);
+    Tensor mW = make_tensor(gmem_ptr_w, w_layout);
+    auto mW_slice = mW(bidb, bidh, _);
+
+    Tensor caccP = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor taccPcP = thr_mma.partition_C(caccP);                           // (MMA,MMA_M,MMA_N)
+    static_assert(decltype(size<0>(taccPcP))::value == 4);
+    // Convert to ((2, 2), MMA_M, MMA_N) then take only the col indices.
+    Tensor taccPcP_col = logical_divide(taccPcP, Shape<_2>{})(make_coord(_, 0), 0, _);
 
     //
     // Copy Atom retiling
@@ -928,15 +960,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
-        Tensor acc_w = make_fragment_like(acc_s);
-        cute::copy(tWgW, acc_w);
-        // acc_w(i) = *tWgW.data() + i
-        tWgW.data() = tWgW.data() + (-kBlockN);
-        // We have key_padding_mask so we'll need to Check_inf
-        masking_step == 0
-            ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
-            : softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
-        // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
+        if constexpr (Is_weighted) {
+            Tensor acc_w = make_tensor<float>(Shape<Int</*kNCols=*/2 * size<2>(acc_s)>>{});
+            CUTE_STATIC_ASSERT_V(size(acc_w) == size(taccPcP_col));                     // MMA_N
+            #pragma unroll
+            for (int ni = 0; ni < size(acc_w); ++ni) {
+                const int col = get<1>(taccPcP_col(ni));
+                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+            }
+            // We have key_padding_mask so we'll need to Check_inf
+            masking_step == 0
+                ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
+                : softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        } else {
+            masking_step == 0
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
+        }
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
@@ -1003,10 +1043,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
-        Tensor acc_w = make_fragment_like(acc_s);
-        cute::copy(tWgW, acc_w);
-        tWgW.data() = tWgW.data() + (-kBlockN);
-        softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        if constexpr (Is_weighted) {
+            Tensor acc_w = make_tensor<float>(Shape<Int</*kNCols=*/2 * size<2>(acc_s)>>{});
+            CUTE_STATIC_ASSERT_V(size(acc_w) == size(taccPcP_col));                     // MMA_N
+            #pragma unroll
+            for (int ni = 0; ni < size(acc_w); ++ni) {
+                const int col = get<1>(taccPcP_col(ni));
+                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+                // std::printf("(%d) [%d => %d] %.2f\n", threadIdx.x, col, ni, float(acc_w(ni)));
+            }
+            softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
+        } else {
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+        }
 
         Tensor rP = flash::convert_type<Element>(acc_s);
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
@@ -1096,7 +1145,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_weighted, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1112,12 +1161,12 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_weighted, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_weighted, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1126,7 +1175,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_weighted, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

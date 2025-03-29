@@ -201,12 +201,12 @@ if not SKIP_CUDA_BUILD:
                         # "--ptxas-options=-v",
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
+                        "-DFLASHATTENTION_DISABLE_BACKWARD",
+                        "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        "-DFLASHATTENTION_DISABLE_ALIBI",
+                        "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + cc_flag
                 ),
@@ -249,6 +249,11 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.9",
+    packages=find_packages(
+        include=(
+            "weighted_flash_decoding",
+        ),
+    ),
     install_requires=[
         "torch",
         "einops",

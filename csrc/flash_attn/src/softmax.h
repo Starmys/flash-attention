@@ -38,16 +38,15 @@ template<bool zero_init=true, typename Engine0, typename Layout0, typename Engin
 __device__ __forceinline__ void weighted_thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Tensor<Engine2, Layout2> const &weight, Operator &op) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    static_assert(Layout2::rank == 2, "Only support 1D Tensor");
+    static_assert(Layout2::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
-    CUTE_STATIC_ASSERT_V(size<0>(weight) == size<0>(tensor));
-    CUTE_STATIC_ASSERT_V(size<1>(weight) == size<1>(tensor));
+    CUTE_STATIC_ASSERT_V(size<0>(weight) == size<1>(tensor));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); mi++) {
-        summary(mi) = zero_init ? (tensor(mi, 0) * weight(mi, 0)) : op(summary(mi), tensor(mi, 0) * weight(mi, 0));
+        summary(mi) = zero_init ? (tensor(mi, 0) * weight(0)) : op(summary(mi), tensor(mi, 0) * weight(0));
         #pragma unroll
         for (int ni = 1; ni < size<1>(tensor); ni++) {
-            summary(mi) = op(summary(mi), tensor(mi, ni) * weight(mi, ni));
+            summary(mi) = op(summary(mi), tensor(mi, ni) * weight(ni));
         }
     }
 }
@@ -190,10 +189,9 @@ struct Softmax {
     };
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
-    __forceinline__ __device__ void softmax_weighted_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, Tensor2 &acc_w, float softmax_scale_log2) {
+    __forceinline__ __device__ void softmax_weighted_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, Tensor2 &weight, float softmax_scale_log2) {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-        Tensor weight = make_tensor(acc_w.data(), flash::convert_layout_acc_rowcol(acc_w.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         if (Is_first) {
             flash::template reduce_max</*zero_init=*/true>(scores, row_max);
