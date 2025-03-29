@@ -197,6 +197,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     static_assert(decltype(size<0>(taccPcP))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_N) then take only the col indices.
     Tensor taccPcP_col = logical_divide(taccPcP, Shape<_2>{})(make_coord(_, 0), 0, _);
+    Tensor gW = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block_max - 1));
 
     //
     // Copy Atom retiling
@@ -357,8 +358,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             #pragma unroll
             for (int ni = 0; ni < size(acc_w); ++ni) {
                 const int col = get<1>(taccPcP_col(ni));
-                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+                acc_w(ni) = gW(col);
             }
+            gW.data() = gW.data() + (-kBlockN);
             masking_step == 0
                 ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
                 : softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
@@ -434,8 +436,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             #pragma unroll
             for (int ni = 0; ni < size(acc_w); ++ni) {
                 const int col = get<1>(taccPcP_col(ni));
-                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+                acc_w(ni) = gW(col);
             }
+            gW.data() = gW.data() + (-kBlockN);
             softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
         } else {
             softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -678,6 +681,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     static_assert(decltype(size<0>(taccPcP))::value == 4);
     // Convert to ((2, 2), MMA_M, MMA_N) then take only the col indices.
     Tensor taccPcP_col = logical_divide(taccPcP, Shape<_2>{})(make_coord(_, 0), 0, _);
+    Tensor gW = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block_max - 1));
 
     //
     // Copy Atom retiling
@@ -966,8 +970,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             #pragma unroll
             for (int ni = 0; ni < size(acc_w); ++ni) {
                 const int col = get<1>(taccPcP_col(ni));
-                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
+                acc_w(ni) = gW(col);
             }
+            gW.data() = gW.data() + (-kBlockN);
             // We have key_padding_mask so we'll need to Check_inf
             masking_step == 0
                 ? softmax.template softmax_weighted_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, acc_w, params.scale_softmax_log2)
@@ -1049,9 +1054,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             #pragma unroll
             for (int ni = 0; ni < size(acc_w); ++ni) {
                 const int col = get<1>(taccPcP_col(ni));
-                acc_w(ni) = local_tile(mW_slice, Shape<Int<kBlockN>>{}, make_coord(n_block))(col);
-                // std::printf("(%d) [%d => %d] %.2f\n", threadIdx.x, col, ni, float(acc_w(ni)));
+                acc_w(ni) = gW(col);
             }
+            gW.data() = gW.data() + (-kBlockN);
             softmax.template softmax_weighted_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, acc_w, params.scale_softmax_log2);
         } else {
             softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
