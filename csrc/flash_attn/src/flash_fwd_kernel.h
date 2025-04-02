@@ -1212,6 +1212,8 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(lse_size, _1{}));
+    Tensor gLSEprevious = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseprevious_ptr) + row_offset_lse),
+                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
 
     // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in get_lse_tile.
     // This tensor's layout maps row_offset_lse to {bidb, bidh, q_offset}.
@@ -1235,9 +1237,10 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
-        ElementAccum lse = (row < params.num_segments && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
+        ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) :
+            (row < params.num_segments && col < lse_size - bidx * kBlockM) ? gLSEprevious(col) :
+            -INFINITY;
         if (row < kMaxSplits) { sLSE[row][col] = lse; }
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
     // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
     __syncthreads();
@@ -1297,6 +1300,9 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
+    Tensor gOprevious = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.oprevious_ptr) + row_offset_oaccum),
+                                Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                Stride<Int<kHeadDim>, _1>{});
     constexpr int kBlockN = kNThreads / kBlockM;
     using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
     using GmemTiledCopyOaccum = decltype(
@@ -1304,23 +1310,33 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
+    using GmemTiledCopyOprevious = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtomOaccum{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+    GmemTiledCopyOprevious gmem_tiled_copy_Oprevious;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
+    auto gmem_thr_copy_Oprevious = gmem_tiled_copy_Oprevious.get_thread_slice(tidx);
     Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
+    Tensor tOgOprevious = gmem_thr_copy_Oprevious.partition_S(gOprevious);
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
+    Tensor tOrOprevious = make_tensor<Element>(shape(tOgOaccum));
     clear(tOrO);
 
     // Predicates
     Tensor cOaccum = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
     // Repeat the partitioning with identity layouts
     Tensor tOcOaccum = gmem_thr_copy_Oaccum.partition_S(cOaccum);
+    Tensor tOcOprevious = gmem_thr_copy_Oprevious.partition_S(cOaccum);
     Tensor tOpOaccum = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     if (!Is_even_K) {
         #pragma unroll
         for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d; }
     }
     // Load Oaccum in then scale and accumulate to O
-    for (int split = 0; split < params.num_segments; ++split) {
+    for (int split = 0; split < params.num_splits; ++split) {
+    // for (int split = 0; split < params.num_segments; ++split) {
         flash::copy</*Is_even_MN=*/false, Is_even_K>(
             gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
         );
@@ -1338,6 +1354,25 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
         tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
+    }
+    for (int split = params.num_splits; split < params.num_segments; ++split) {
+        Tensor rO = flash::convert_type<Element>(tOrO);
+        flash::copy</*Is_even_MN=*/false, Is_even_K>(
+            gmem_tiled_copy_Oprevious, tOgOprevious, tOrOprevious, tOcOprevious, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
+        );
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOrOprevious); ++m) {
+            int row = get<0>(tOcOprevious(0, m, 0));
+            ElementAccum lse_scale = sLSE[split][row];
+            #pragma unroll
+            for (int k = 0; k < size<2>(tOrOprevious); ++k) {
+                #pragma unroll
+                for (int i = 0; i < size<0>(tOrOprevious); ++i) {
+                    tOrO(i, m, k) += lse_scale * (ElementAccum)(tOrOprevious(i, m, k));
+                }
+            }
+        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
+        }
     }
     // if (cute::thread0()) { print_tensor(tOrO); }
 
