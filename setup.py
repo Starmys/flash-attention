@@ -177,11 +177,11 @@ if not SKIP_CUDA_BUILD:
             sources=[
                 "csrc/flash_attn/flash_api.cpp",
                 "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
-                # "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
                 # "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu",
                 # "csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
-                # "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
                 # "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_causal_sm80.cu",
                 # "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu",
             ],
