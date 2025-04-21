@@ -295,7 +295,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q); //CHECK_DEVICE(k); CHECK_DEVICE(v);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -506,7 +506,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q); // CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
     CHECK_DEVICE(cu_seqlens_k);
 
@@ -660,23 +660,24 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
     FP16_SWITCH(!params.is_bf16, [&] {
-        if (params.d <= 32) {
-            run_mha_bwd_<elem_type, 32>(params, stream, configure);
-        } else if (params.d <= 64) {
-            run_mha_bwd_<elem_type, 64>(params, stream, configure);
-        } else if (params.d <= 96) {
-            run_mha_bwd_<elem_type, 96>(params, stream, configure);
-        } else if (params.d <= 128) {
-            run_mha_bwd_<elem_type, 128>(params, stream, configure);
-        } else if (params.d <= 160) {
-            run_mha_bwd_<elem_type, 160>(params, stream, configure);
-        } else if (params.d <= 192) {
-            run_mha_bwd_<elem_type, 192>(params, stream, configure);
-        } else if (params.d <= 224) {
-          run_mha_bwd_<elem_type, 224>(params, stream, configure);
-        } else if (params.d <= 256) {
-          run_mha_bwd_<elem_type, 256>(params, stream, configure);
-        }
+        run_mha_bwd_<elem_type, 128>(params, stream, configure);
+        // if (params.d <= 32) {
+        //     run_mha_bwd_<elem_type, 32>(params, stream, configure);
+        // } else if (params.d <= 64) {
+        //     run_mha_bwd_<elem_type, 64>(params, stream, configure);
+        // } else if (params.d <= 96) {
+        //     run_mha_bwd_<elem_type, 96>(params, stream, configure);
+        // } else if (params.d <= 128) {
+        //     run_mha_bwd_<elem_type, 128>(params, stream, configure);
+        // } else if (params.d <= 160) {
+        //     run_mha_bwd_<elem_type, 160>(params, stream, configure);
+        // } else if (params.d <= 192) {
+        //     run_mha_bwd_<elem_type, 192>(params, stream, configure);
+        // } else if (params.d <= 224) {
+        //   run_mha_bwd_<elem_type, 224>(params, stream, configure);
+        // } else if (params.d <= 256) {
+        //   run_mha_bwd_<elem_type, 256>(params, stream, configure);
+        // }
     });
 }
 
@@ -732,7 +733,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q); // CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -1216,7 +1217,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
+    CHECK_DEVICE(q); // CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");

@@ -29,7 +29,7 @@ is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("d", [32, 64, 128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [   

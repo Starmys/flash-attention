@@ -136,11 +136,7 @@ struct Flash_fwd_kernel_traits : public Base {
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
-    using Gmem_copy_struct = std::conditional_t<
-        Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
-        DefaultCopy
-    >;
+    using Gmem_copy_struct = AutoVectorizingCopyWithAssumedAlignment<128>;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
@@ -353,11 +349,7 @@ struct Flash_bwd_kernel_traits : public Base {
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
-    using Gmem_copy_struct = std::conditional_t<
-        Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
-        DefaultCopy
-    >;
+    using Gmem_copy_struct = DefaultCopy;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
                         GmemLayoutAtom{},
